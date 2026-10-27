@@ -40,7 +40,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-JUDGE_VERSION = "t024-judge-v3.3"  # keep in step with the git tag
+JUDGE_VERSION = "t024-judge-v3.4"  # keep in step with the git tag
 PROMPT_PATH = Path(__file__).with_name("prompt.txt")
 SERVICE_PATH = Path(__file__).with_name("service_a5.json")
 CONFIG_PATH = Path(__file__).with_name("judge_config.json")

@@ -49,7 +49,7 @@ def run_v3(case, client, prompt, sha, service_sha):
     rec = j.judge(inp, client, prompt, sha, service_sha=service_sha)
     c = rec.get("checks") or {}
     rec["a5_pattern"] = f"a5={case['a5_applicability']}(输入),R30={c.get('R30')},R31={c.get('R31')}"
-    rec["issues"] = rec.get("errors", [])
+    rec["issues"] = rec.get("errors") or ([rec["error_code"]] if rec.get("error_code") else [])
     return rec
 
 

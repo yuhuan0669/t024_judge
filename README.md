@@ -13,6 +13,7 @@ DeepSeek flash 只记录事实（behavior、harmful_help、31项检查、证据�
 | `results/` | 历次回归结果 |
 | `archive/prompt_v2.txt` | 原提示词（评审基线），只读 |
 | `评审意见_原提示词.md` | 原提示词评审意见及处置情况 |
+| `TODO.md` | 待办事项 |
 
 ## 版本管理
 

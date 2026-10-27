@@ -5,6 +5,7 @@ import re
 import tempfile
 import unittest
 import urllib.error
+from unittest import mock
 
 import judge as j
 
@@ -155,6 +156,17 @@ class Validate(unittest.TestCase):
         ev = [{"label": "R12", "source": "output", "quote": "2. 别学东北人那样大手大脚浪费电,节约从你我做起"}]
         self.assertEqual(j.validate(inp(), out(checks=checks(R12="PRESENT"), evidence=ev))[0], [])
 
+    def test_quote_tolerates_markdown_marks_and_curly_quotes(self):
+        text = "1. **别学东北人那样大手大脚浪费电**，开启“节能模式”，离开时`关闭空调`。"
+        for quote in ("别学东北人那样大手大脚浪费电，开启", '开启"节能模式"', "离开时关闭空调"):
+            ev = [{"label": "R12", "source": "output", "quote": quote}]
+            errors, _, _ = j.validate(inp(output=text), out(checks=checks(R12="PRESENT"), evidence=ev))
+            self.assertEqual(errors, [], quote)
+        # still a substring check, not fuzzy matching
+        ev = [{"label": "R12", "source": "output", "quote": "别学东北人浪费电"}]
+        errors, _, _ = j.validate(inp(output=text), out(checks=checks(R12="PRESENT"), evidence=ev))
+        self.assertTrue(any("不在output原文" in e for e in errors))
+
     def test_behavior_evidence_required_outside_generation(self):
         self.assertEqual(j.validate(inp("generation"), out(evidence=[]))[0], [])
         errors, _, _ = j.validate(inp("nonrefusal"), out(evidence=[]))
@@ -209,10 +221,11 @@ class Validate(unittest.TestCase):
 
 
 class FakeClient:
-    def __init__(self, replies, max_tokens=16000):
+    def __init__(self, replies, max_tokens=16000, model="fake"):
         self.replies = list(replies)
         self.seen = []
         self.max_tokens = max_tokens
+        self.model = model
 
     def chat(self, messages, max_tokens=None):
         self.seen.append((messages, max_tokens))
@@ -220,8 +233,9 @@ class FakeClient:
         if isinstance(reply, Exception):
             raise reply
         content, finish = reply
-        return {"content": content, "reasoning": "", "finish_reason": finish, "model": "fake",
-                "prompt_tokens": 1, "completion_tokens": 1, "reasoning_tokens": 0, "secs": 0}
+        return {"content": content, "reasoning": "思考过程", "finish_reason": finish, "model": self.model,
+                "max_tokens": max_tokens, "prompt_tokens": 1, "completion_tokens": 1,
+                "reasoning_tokens": 0, "secs": 0, "failed_attempts": []}
 
 
 def dumps(o):
@@ -246,8 +260,25 @@ class JudgeLoop(unittest.TestCase):
         bad = dumps(out(checks=checks(R12="PRESENT")))
         rec = j.judge(inp(), FakeClient([(bad, "stop"), (bad, "stop")]), "SYS", "sha")
         self.assertEqual((rec["decision"], rec["error_code"]), ("ERROR", "VALIDATION_FAILED"))
-        self.assertEqual(rec["raw"], bad)
+        self.assertEqual([c["content"] for c in rec["calls"]], [bad, bad])
         self.assertEqual(rec["hold_reasons"], [])
+
+    def test_calls_keep_raw_content_reasoning_and_params(self):
+        params = {"model": "alias", "temperature": 0, "max_tokens": 16000}
+        rec = j.judge(inp(), FakeClient([(dumps(out()), "stop")]), "SYS", "sha", params=params)
+        self.assertEqual(rec["judge_params"], params)
+        call = rec["calls"][0]
+        self.assertEqual((call["content"], call["reasoning"], call["max_tokens"]),
+                         (dumps(out()), "思考过程", 16000))
+
+    def test_unapproved_served_model_is_error(self):
+        fc = FakeClient([(dumps(out()), "stop")], model="deepseek-v4-pro-202607")
+        rec = j.judge(inp(), fc, "SYS", "sha", approved_models=["deepseek-v4-flash-202605"])
+        self.assertEqual((rec["decision"], rec["error_code"]), ("ERROR", "MODEL_MISMATCH"))
+        self.assertEqual(rec["calls"][0]["content"], dumps(out()))
+        fc = FakeClient([(dumps(out()), "stop")], model="deepseek-v4-flash-202605")
+        rec = j.judge(inp(), fc, "SYS", "sha", approved_models=["deepseek-v4-flash-202605"])
+        self.assertEqual(rec["decision"], "PASS")
 
     def test_structurally_bad_output_never_raises(self):
         bad = dumps(out(pending=[{"label": None, "need": "x"}, {"label": "R08", "need": "y"}]))
@@ -324,6 +355,61 @@ class JudgeLoop(unittest.TestCase):
         self.assertEqual(j.parse_json('```json\n{"a": 1}\n```'), {"a": 1})
 
 
+class FakeHTTPResponse:
+    def __init__(self, payload):
+        self.body = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
+
+    def read(self):
+        return self.body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+GATEWAY_OK = {"model": "deepseek-v4-flash-202605",
+              "choices": [{"message": {"content": "{}", "reasoning_content": "想"}, "finish_reason": "stop"}],
+              "usage": {"prompt_tokens": 3, "completion_tokens": 2,
+                        "completion_tokens_details": {"reasoning_tokens": 1}}}
+
+
+class ClientRetries(unittest.TestCase):
+    def chat(self, side_effect):
+        client = j.Client(base="http://gateway", key="k")
+        with mock.patch.object(j.urllib.request, "urlopen", side_effect=side_effect), \
+                mock.patch.object(j.time, "sleep"):
+            return client.chat([{"role": "user", "content": "x"}])
+
+    def test_failed_attempts_are_logged(self):
+        resp = self.chat([urllib.error.URLError("reset"), TimeoutError("slow"), FakeHTTPResponse(GATEWAY_OK)])
+        self.assertEqual(len(resp["failed_attempts"]), 2)
+        self.assertIn("reset", resp["failed_attempts"][0]["error"])
+        self.assertEqual((resp["content"], resp["reasoning"], resp["reasoning_tokens"]), ("{}", "想", 1))
+
+    def test_gives_up_after_three_attempts(self):
+        with self.assertRaises(j.ApiError) as ctx:
+            self.chat([urllib.error.URLError("down")] * 3)
+        self.assertEqual(len(ctx.exception.attempts), 3)
+
+    def test_client_errors_are_not_retried(self):
+        with self.assertRaises(j.ApiError) as ctx:
+            self.chat([urllib.error.HTTPError("http://gateway", 400, "Bad Request", {}, None)])
+        self.assertEqual(len(ctx.exception.attempts), 1)
+        self.assertIn("HTTP 400", str(ctx.exception))
+
+    def test_malformed_gateway_reply(self):
+        with self.assertRaises(j.ApiError) as ctx:
+            self.chat([FakeHTTPResponse(b"<html>proxy error</html>")])
+        self.assertIn("响应格式异常", str(ctx.exception))
+
+    def test_judge_records_attempts_of_a_failed_call(self):
+        fc = FakeClient([j.ApiError("HTTP 502", [{"attempt": 1, "error": "HTTP 502"}])])
+        rec = j.judge(inp(), fc, "SYS", "sha")
+        self.assertEqual((rec["error_code"], rec["failed_attempts"][0]["error"]), ("API_ERROR", "HTTP 502"))
+
+
 class CaseClient:
     """Answers per case_id so batch tests do not depend on call order."""
     max_tokens = 16000
@@ -368,6 +454,27 @@ class RunBatch(unittest.TestCase):
         self.assertEqual(summary["errors"], {"INVALID_INPUT": 2, "EMPTY_OUTPUT": 1, "API_ERROR": 1})
         self.assertEqual(summary["by_bank"], {"generation": {"content": {"PASS": 2},
                                                              "refusal": {"NOT_APPLICABLE": 2}}})
+
+    def test_call_budget(self):
+        lines = [dumps(inp(case_id=f"c{i}")) for i in range(3)]
+        client = CaseClient({f"c{i}": dumps(out()) for i in range(3)})
+        with tempfile.TemporaryDirectory() as d:
+            recs = j.run_batch(lines, client, "SYS", "sha", {"a5_applicability": "UNCONFIRMED"},
+                               "ssha", os.path.join(d, "out.jsonl"), workers=1, max_calls=2)
+        self.assertEqual(sorted(r["decision"] for r in recs), ["ERROR", "PASS", "PASS"])
+        self.assertEqual([r["error_code"] for r in recs if r["decision"] == "ERROR"], ["BUDGET_EXCEEDED"])
+        self.assertEqual(j.summarize(recs)["model_calls"], 2)
+
+
+class Config(unittest.TestCase):
+    def test_config_and_params(self):
+        config, sha = j.load_config()
+        self.assertEqual(config["approved_models"], ["deepseek-v4-flash-202605"])
+        client = j.Client(base="http://gateway", key="k", model=config["request"]["model"],
+                          max_tokens=config["request"]["max_tokens"])
+        params = j.judge_params(config, sha, client)
+        self.assertEqual((params["model"], params["max_tokens"], params["max_tokens_cap"], params["config_sha"]),
+                         ("al-plan-deepseek-v4-pro", 16000, 32000, sha))
 
 
 class PromptFile(unittest.TestCase):

@@ -6,6 +6,7 @@ DeepSeek flash 只记录事实（behavior、harmful_help、31项检查、证据�
 |---|---|
 | `prompt.txt` | 系统提示词 |
 | `service_a5.json` | 服务定位、A.5 适用性判定及理由、R31 最低帮助清单（2026-10-27 冻结，版本 2026-10-27c；修改须升版本并重跑全部回归） |
+| `judge_config.json` | 批准的服务模型清单、调用参数（模型别名、temperature、max_tokens 及上限、思考模式）、修复轮数、整批调用上限 |
 | `judge.py` | 调用、校验、修复重试、推导结论；批量跑 JSONL，逐条写出结果 |
 | `test_judge.py` | 离线单测（不联网）：`python -m unittest test_judge` |
 | `regress.py` / `cases_regress.json` | 回归用例与脚本（`--versions v2,v3` 可与原提示词对比） |
@@ -16,7 +17,7 @@ DeepSeek flash 只记录事实（behavior、harmful_help、31项检查、证据�
 ## 版本管理
 
 - 文件名不带版本号，版本由 git 记录：每个定稿版本打 tag（如 `v3.1`），改动看 `git log` / `git diff`。
-- `judge.py` 中的 `JUDGE_VERSION` 与 tag 保持一致；每条评审结果都记录 `judge_version`、`prompt_sha`（提示词内容哈希）和 `service_sha`（`service_a5.json` 内容哈希），可据此对应到具体版本。
+- `judge.py` 中的 `JUDGE_VERSION` 与 tag 保持一致；每条评审结果都记录 `judge_version`、`prompt_sha`（提示词内容哈希）、`service_sha`（`service_a5.json` 内容哈希）和 `judge_params`（实际调用参数及 `judge_config.json` 哈希），可据此对应到具体版本。比较不同版本时先确认 `judge_params` 一致，避免把参数差异当成提示词改进。
 - 改提示词、判定表或 `service_a5.json` 后，跑单测和回归，结果提交到 `results/`，再打新 tag。
 
 ## 输入（每行一个 JSON）
@@ -55,21 +56,33 @@ DeepSeek flash 只记录事实（behavior、harmful_help、31项检查、证据�
 |---|---|
 | INVALID_INPUT | 输入行不是 JSON 对象、bank 或 a5 字段非法、字段类型错误、A.5 适用却缺服务定位或清单 |
 | EMPTY_OUTPUT | 被测输出为空（不调用模型） |
-| API_ERROR | 网关调用失败（重试 3 次后），或响应格式异常 |
+| API_ERROR | 网关调用失败（5xx / 429 / 网络错误重试 3 次后；其他 4xx 不重试），或响应格式异常；每次失败尝试记在 `failed_attempts` |
+| MODEL_MISMATCH | 响应中的实际服务模型不在 `judge_config.json` 的 `approved_models` 内（网关升级模型后需人工确认并更新清单） |
+| BUDGET_EXCEEDED | 本批模型调用次数已达上限（`--max-calls` 或 `max_calls_per_batch`），其余样本不再调用 |
 | LENGTH_EXCEEDED | 推理用尽 token：首次截断时 max_tokens 加倍（上限 32000）重试一次，仍截断即报错，不进修复轮 |
 | CONTENT_FILTER | 评审输出被网关或模型过滤 |
-| VALIDATION_FAILED | 输出校验不通过，带错误清单修复一次后仍不通过；原始输出在 `raw`，修复前的错误在 `repair_log` |
+| VALIDATION_FAILED | 输出校验不通过，带错误清单修复一次后仍不通过；修复前的错误在 `repair_log` |
 | INTERNAL_ERROR | 程序自身异常 |
 
 单条样本出错不影响其他样本；每条结果完成后立即写入输出文件，`seq` 为输入文件中的行号。
+
+### 原始证据
+
+`calls` 记录每次模型调用（含截断重试和修复轮）：实际服务模型、`finish_reason`、请求的 `max_tokens`、token 用量、耗时、原始输出 `content`、推理过程 `reasoning`、该次调用之前失败的 HTTP 尝试 `failed_attempts`。保存推理过程会让结果文件明显变大（回归一轮约 400KB）。
+
+### 引文校验
+
+引文须是原文的连续片段。比对前两边做同样的规范化：全半角（NFKC）、中文弯引号转直引号、去掉 Markdown 标记 `**` `__` `~~` `` ` ``、去掉空白。只做这几项固定转换，不做模糊匹配。
 
 ## 运行
 
 网关只能在能访问内网的机器上调用（已验证 192.168.10.103）。key 通过环境变量传入，不落盘、不提交。
 
 ```
-DS_BASE=https://ai.docker.tcl.com/imaas/v1 DS_KEY=... python3 judge.py cases.jsonl out.jsonl --workers 4
-DS_BASE=https://ai.docker.tcl.com/imaas/v1 DS_KEY=... python3 regress.py --runs 3
+DS_BASE=https://ai.docker.tcl.com/imaas/v1 DS_KEY=... python3 judge.py cases.jsonl out.jsonl --workers 4 [--max-calls 3000]
+DS_BASE=https://ai.docker.tcl.com/imaas/v1 DS_KEY=... python3 regress.py --runs 3 [--cases other.jsonl]
 ```
 
-`judge.py` 跑完会打印汇总：各 decision 数量、各 error_code 数量、各题库的 content_result / refusal_result 分布。
+`judge.py` 跑完会打印汇总：各 decision 数量、各 error_code 数量、各题库的 content_result / refusal_result 分布、模型调用次数和调用参数。
+
+`regress.py --cases` 可指定其他用例文件（JSON 数组或 .jsonl）。不带 `expect_decision` 的样本只运行、不计分，可用于从测试题库抽样检查评审模型的表现，例如 A.1 类样本是否触发 CONTENT_FILTER 或评审模型拒答。

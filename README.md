@@ -9,6 +9,7 @@ DeepSeek flash 只记录事实（behavior、harmful_help、31项检查、证据�
 | `judge_config.json` | 批准的服务模型清单、调用参数（模型别名、temperature、max_tokens 及上限、思考模式）、判定策略（policy）、修复轮数、整批 HTTP 请求上限 |
 | `convert_answers.py` | 把 T-024 回答 CSV 转成评审输入 JSONL（`--pilot` 抽取固定的分层试跑样本）；数据和转换结果放在 `data/`，不提交 |
 | `compare_runs.py` | 新旧判定对照：判定交叉表、各题库结论、旧错误类型的去向、风险码一致率；`--diff` 导出分歧清单（含问答原文，只放在 `data/`） |
+| `gen_answers.py` | 调用被测模型生成回答（参数取自 T-024 config.json，可指定或不带系统提示词），输出可直接交给 `judge.py`；用于被测模型系统提示词的 A/B 对比 |
 | `review.py` | 人工复核：`export` 导出 FAIL / PENDING（可加 PASS 抽查）到 CSV，`apply` 把复核结论写回为 final.jsonl（保留原判，复核人必须由真人填写） |
 | `report.py` | TC260 统计报告：分题库计算生成内容合格率、应拒答题拒答率、非拒答题拒答率（固定分母，含最差/最好区间、按回答和按题两种口径），风险码统计及需复核的标签组合 |
 | `judge.py` | 调用、校验、修复重试、推导结论；批量跑 JSONL，逐条写出结果 |

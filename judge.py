@@ -437,6 +437,35 @@ def backoff_s(attempt, retry_after=None):
     return wait
 
 
+def parse_chat_response(data, max_tokens=None):
+    """Validate a chat-completions reply and extract the fields every call
+    record keeps; raises ValueError for a malformed reply."""
+    if not isinstance(data, dict) or not isinstance(data.get("choices"), list):
+        raise ValueError("响应须为含choices数组的对象")
+    choice = data["choices"][0]
+    if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
+        raise ValueError("choices[0]须包含message对象")
+    msg = choice["message"]
+    for field in ("content", "reasoning_content"):
+        if msg.get(field) is not None and not isinstance(msg[field], str):
+            raise ValueError(f"message.{field}须为字符串或null")
+    usage = data.get("usage")
+    usage = {} if usage is None else usage
+    if not isinstance(usage, dict):
+        raise ValueError("usage须为对象或null")
+    details = usage.get("completion_tokens_details")
+    details = {} if details is None else details
+    if not isinstance(details, dict):
+        raise ValueError("completion_tokens_details须为对象或null")
+    return {"content": msg.get("content") or "",
+            "reasoning": msg.get("reasoning_content") or "",
+            "finish_reason": choice.get("finish_reason"), "model": data.get("model"),
+            "max_tokens": max_tokens,
+            "prompt_tokens": usage.get("prompt_tokens", 0),
+            "completion_tokens": usage.get("completion_tokens", 0),
+            "reasoning_tokens": details.get("reasoning_tokens", 0)}
+
+
 class Client:
     """timeout: socket timeout for connecting and for each read; deadline:
     total seconds for one request, checked between reads, because keep-alive
@@ -445,7 +474,7 @@ class Client:
     def __init__(self, base=None, key=None, model=None, max_tokens=16000, temperature=0, timeout=300,
                  deadline=900, budget=None):
         self.base = (base or os.environ["DS_BASE"]).rstrip("/")
-        self.key = key or os.environ["DS_KEY"]
+        self.key = key if key is not None else os.environ["DS_KEY"]  # "" = no Authorization header
         self.model = model or os.environ.get("DS_MODEL", "al-plan-deepseek-v4-pro")
         self.max_tokens = max_tokens
         self.temperature = temperature
@@ -470,9 +499,20 @@ class Client:
                 "max_tokens": max_tokens or self.max_tokens,
                 "response_format": {"type": "json_object"},
                 "messages": messages}
-        req = urllib.request.Request(
-            self.base + "/chat/completions", data=json.dumps(body).encode("utf-8"),
-            headers={"Authorization": "Bearer " + self.key, "Content-Type": "application/json"})
+        response, secs, failed = self.post(body, lambda data: parse_chat_response(data, body["max_tokens"]))
+        response.update(secs=secs, failed_attempts=failed)
+        return response
+
+    def post(self, body, parse=parse_chat_response):
+        """Send one chat-completions request body with the retry policy and
+        request budget. parse(data) runs inside the retry loop, so a malformed
+        reply is recorded as a bad_response attempt; returns
+        (parsed, seconds, failed_attempts)."""
+        headers = {"Content-Type": "application/json"}
+        if self.key:
+            headers["Authorization"] = "Bearer " + self.key
+        req = urllib.request.Request(self.base + "/chat/completions", data=json.dumps(body).encode("utf-8"),
+                                     headers=headers)
         failed = []
         for attempt in range(1, MAX_ATTEMPTS + 1):
             if self.budget is not None and not self.budget.take():
@@ -481,30 +521,7 @@ class Client:
             last = attempt == MAX_ATTEMPTS
             try:
                 data = json.loads(self._read(req, t0).decode("utf-8"))
-                if not isinstance(data, dict) or not isinstance(data.get("choices"), list):
-                    raise ValueError("响应须为含choices数组的对象")
-                choice = data["choices"][0]
-                if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
-                    raise ValueError("choices[0]须包含message对象")
-                msg = choice["message"]
-                for field in ("content", "reasoning_content"):
-                    if msg.get(field) is not None and not isinstance(msg[field], str):
-                        raise ValueError(f"message.{field}须为字符串或null")
-                usage = data.get("usage")
-                usage = {} if usage is None else usage
-                if not isinstance(usage, dict):
-                    raise ValueError("usage须为对象或null")
-                details = usage.get("completion_tokens_details")
-                details = {} if details is None else details
-                if not isinstance(details, dict):
-                    raise ValueError("completion_tokens_details须为对象或null")
-                response = {"content": msg.get("content") or "",
-                            "reasoning": msg.get("reasoning_content") or "",
-                            "finish_reason": choice.get("finish_reason"), "model": data.get("model"),
-                            "max_tokens": body["max_tokens"],
-                            "prompt_tokens": usage.get("prompt_tokens", 0),
-                            "completion_tokens": usage.get("completion_tokens", 0),
-                            "reasoning_tokens": details.get("reasoning_tokens", 0)}
+                parsed = parse(data)
                 break
             except urllib.error.HTTPError as e:
                 retryable = e.code == 429 or e.code >= 500
@@ -521,8 +538,7 @@ class Client:
                 failed.append(_attempt(attempt, t0, "bad_response", f"响应格式异常: {type(e).__name__}: {e}", None))
                 raise ApiError(failed[-1]["error"], failed)
             time.sleep(wait)
-        response.update(secs=round(time.time() - t0, 1), failed_attempts=failed)
-        return response
+        return parsed, round(time.time() - t0, 1), failed
 
 
 def _attempt(n, t0, kind, error, wait):

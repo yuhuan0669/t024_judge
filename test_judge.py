@@ -793,6 +793,56 @@ class Report(unittest.TestCase):
         self.assertIn("生成内容合格率", report.to_markdown(rep))
 
 
+class GenAnswers(unittest.TestCase):
+    PARAMS = {"model": "octa", "temperature": 0.7, "max_tokens": 2048, "stream": True,
+              "chat_template_kwargs": {"enable_thinking": False}}
+
+    def setUp(self):
+        import gen_answers
+        self.g = gen_answers
+
+    def test_body(self):
+        body = self.g.build_body(self.PARAMS, None, "问题")
+        self.assertEqual(body["messages"], [{"role": "user", "content": "问题"}])
+        self.assertEqual((body["stream"], body["temperature"], body["chat_template_kwargs"]),
+                         (False, 0.7, {"enable_thinking": False}))
+        body = self.g.build_body(self.PARAMS, "系统", "问题")
+        self.assertEqual(body["messages"][0], {"role": "system", "content": "系统"})
+
+    def test_load_params(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "c.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"run_id": "x", "generation_parameters": self.PARAMS}, f)
+            self.assertEqual(self.g.load_params(p)["model"], "octa")
+
+    def test_generate_and_resume(self):
+        reply = dict(GATEWAY_OK, model="octa", choices=[{"message": {"content": "答案"}, "finish_reason": "stop"}])
+        sent = []
+
+        def urlopen(req, timeout):
+            sent.append(json.loads(req.data.decode("utf-8")))
+            if "坏" in sent[-1]["messages"][-1]["content"]:
+                raise urllib.error.HTTPError("http://lora", 400, "bad", {}, None)
+            return FakeHTTPResponse(reply)
+
+        cases = [dict(inp(case_id=k), question=q) for k, q in (("a", "问甲"), ("b", "坏题"), ("c", "问丙"))]
+        client = j.Client(base="http://lora/v1", key="")
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(j.urllib.request, "urlopen", side_effect=urlopen):
+            path = os.path.join(d, "out.jsonl")
+            recs = self.g.run(cases, client, self.PARAMS, None, "A", path, workers=1)
+            by = {r["case_id"]: r for r in recs}
+            self.assertEqual((by["a"]["exposed_output"], by["a"]["gen"]["finish_reason"]), ("答案", "stop"))
+            self.assertEqual((by["b"]["exposed_output"], by["b"]["gen"]["failed_attempts"][0]["kind"]), ("", "http_4xx"))
+            self.assertEqual(by["a"]["gen"]["system_sha"], "none")
+            self.assertNotIn("ref_bank_decision", by["a"])
+            self.assertTrue(all("Authorization" not in r for r in sent))
+            sent.clear()
+            recs = self.g.run(cases, client, self.PARAMS, "系统", "C", path, workers=1, resume=True)
+            self.assertEqual([s["messages"][-1]["content"] for s in sent], ["坏题"])  # only the failed one again
+            self.assertEqual(len(recs), 3)
+
+
 class PromptFile(unittest.TestCase):
     def test_rubric_and_example(self):
         text, _ = j.load_prompt()

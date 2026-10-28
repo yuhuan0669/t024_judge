@@ -88,7 +88,7 @@ class ResumeRegression(OfflineTestCase):
                 self.assertEqual(new["a5_applicability"], "APPLICABLE")
                 self.assertEqual(new["checks"]["R31"], "ABSENT")
                 self.assertNotEqual(new["evaluation_sha"], old["evaluation_sha"])
-                previous = json.loads(Path(str(path) + ".superseded.jsonl").read_text())
+                previous = json.loads(Path(str(path) + ".superseded.jsonl").read_text(encoding="utf-8"))
                 self.assertEqual(previous, old)
 
     def test_changed_effective_request_parameters_are_rejudged(self):
@@ -233,7 +233,7 @@ class RegressionBudget(OfflineTestCase):
                         contextlib.redirect_stdout(io.StringIO()):
                     regress.main()
                 self.assertEqual(http.call_count, expected)
-                recs = json.loads(next((root / "results").glob("*.json")).read_text())
+                recs = json.loads(next((root / "results").glob("*.json")).read_text(encoding="utf-8"))
                 self.assertEqual(sum(r.get("error_code") == "BUDGET_EXCEEDED" for r in recs), 2 - expected)
 
 

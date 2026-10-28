@@ -841,6 +841,8 @@ class GenAnswers(unittest.TestCase):
             recs = self.g.run(cases, client, self.PARAMS, "系统", "C", path, workers=1, resume=True)
             self.assertEqual([s["messages"][-1]["content"] for s in sent], ["坏题"])  # only the failed one again
             self.assertEqual(len(recs), 3)
+            self.g.run(cases[:1], client, self.PARAMS, None, "A", path, workers=1)  # no --resume
+            self.assertEqual(len([n for n in os.listdir(d) if n.startswith("out.jsonl.bak-")]), 1)
 
 
 class PromptFile(unittest.TestCase):

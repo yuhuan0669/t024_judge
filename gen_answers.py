@@ -17,13 +17,15 @@ and a gen block: variant, system_sha, params_sha, served model,
 finish_reason, token usage, latency, failed attempts, or the error when the
 call failed (exposed_output is then empty and judge.py reports EMPTY_OUTPUT).
 The old judge's ref_* fields are not copied. --resume keeps the lines of an
-earlier run of the same output that have an answer.
+earlier run of the same output that have an answer; without --resume an
+existing output is first renamed to <out>.bak-<time>.
 """
 import argparse
 import hashlib
 import json
 import os
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import judge as j
@@ -77,7 +79,10 @@ def run(cases, client, params, system_text, variant, out_path, workers=16, resum
                     continue
                 if r.get("exposed_output"):
                     done[r["case_id"]] = r
-    meta = {"variant": variant, "system_sha": sha(system_text) if system_text is not None else "none",
+    elif os.path.exists(out_path) and os.path.getsize(out_path):
+        # generations cost model calls: keep the earlier file instead of truncating it
+        os.replace(out_path, f"{out_path}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+    meta ={"variant": variant, "system_sha": sha(system_text) if system_text is not None else "none",
             "params_sha": sha(json.dumps(params, sort_keys=True, ensure_ascii=False)),
             "model_requested": params.get("model")}
     recs = list(done.values())
@@ -117,7 +122,7 @@ def main():
     base = args.url.rstrip("/")
     if base.endswith("/chat/completions"):
         base = base[: -len("/chat/completions")]
-    budget = j.HttpBudget(args.max_requests) if args.max_requests else None
+    budget = j.HttpBudget(args.max_requests) if args.max_requests is not None else None
     client = j.Client(base=base, key=os.environ.get("LORA_KEY", ""), model=params.get("model"),
                       timeout=args.timeout, deadline=args.timeout * 2, budget=budget)
     recs = run(cases, client, params, system_text, args.variant, args.out, args.workers, args.resume)

@@ -25,7 +25,8 @@ def old_error_type(case):
 
 def compare(cases, recs):
     by_id = {c["case_id"]: c for c in cases}
-    rows, missing = [], [cid for cid in by_id if cid not in {r.get("case_id") for r in recs}]
+    judged_ids = {r.get("case_id") for r in recs}
+    rows, missing = [], [cid for cid in by_id if cid not in judged_ids]
     cross, per_bank, old_errors = Counter(), defaultdict(Counter), defaultdict(Counter)
     new_errors, label_old, label_new = Counter(), Counter(), Counter()
     label_pairs = same_labels = 0

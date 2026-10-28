@@ -47,7 +47,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-JUDGE_VERSION = "t024-judge-v3.8.1"  # keep in step with the git tag
+JUDGE_VERSION = "t024-judge-v3.9"  # keep in step with the git tag
 PROMPT_PATH = Path(__file__).with_name("prompt.txt")
 SERVICE_PATH = Path(__file__).with_name("service_a5.json")
 CONFIG_PATH = Path(__file__).with_name("judge_config.json")
@@ -116,8 +116,10 @@ def input_sha(inp):
 
 
 def judge_input(inp):
-    """The effective input sent to the judge, excluding comparison-only fields."""
-    return {k: inp[k] for k in JUDGE_INPUT_KEYS if k in inp}
+    """The effective input sent to the judge, excluding comparison-only fields.
+    Refusal-bank cases never carry a5_min_help: R31 is not evaluated there."""
+    skip = {"a5_min_help"} if inp.get("bank") == "refusal" else set()
+    return {k: inp[k] for k in JUDGE_INPUT_KEYS if k in inp and k not in skip}
 
 
 def evaluation_sha(inp, prompt_sha, service_sha, params):
@@ -592,13 +594,14 @@ def judge_params(config, config_sha, client):
 def apply_service(case, service):
     """Fill the service fields a case does not set itself from the service config.
     service_profile is always passed on (R07 uses it to tell what data the
-    service cannot obtain); a5_min_help only when A.5 applies."""
+    service cannot obtain); a5_min_help only when A.5 applies and the case is
+    not a refusal-bank question (R31 is not evaluated there)."""
     merged = dict(case)
     for k in ("a5_applicability", "service_profile"):
         if k not in merged and k in service:
             merged[k] = service[k]
-    if merged.get("a5_applicability") == "APPLICABLE" and "a5_min_help" not in merged \
-            and "a5_min_help" in service:
+    if merged.get("a5_applicability") == "APPLICABLE" and merged.get("bank") != "refusal" \
+            and "a5_min_help" not in merged and "a5_min_help" in service:
         merged["a5_min_help"] = service["a5_min_help"]
     return merged
 
@@ -615,7 +618,8 @@ def check_input(inp):
     if not _is_str_in(inp.get("a5_applicability"), A5_VALUES):
         problems.append(f"a5_applicability非法: {inp.get('a5_applicability')!r}")
     if inp.get("a5_applicability") == "APPLICABLE":
-        for k in ("service_profile", "a5_min_help"):
+        required = ("service_profile",) if inp.get("bank") == "refusal" else ("service_profile", "a5_min_help")
+        for k in required:
             if not inp.get(k):
                 problems.append(f"a5_applicability=APPLICABLE时必须提供{k}")
     for k in ("question", "exposed_output", "visible_reasoning"):

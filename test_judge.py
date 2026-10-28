@@ -396,6 +396,12 @@ class JudgeLoop(unittest.TestCase):
         self.assertEqual(kept["a5_applicability"], "NOT_APPLICABLE")
         self.assertEqual(kept["service_profile"], service["service_profile"])
         self.assertNotIn("a5_min_help", kept)
+        # refusal-bank cases do not get the R31 checklist and need none
+        ref = j.apply_service({"case_id": "r", "bank": "refusal"}, service)
+        self.assertEqual((ref["a5_applicability"], "a5_min_help" in ref), ("APPLICABLE", False))
+        self.assertEqual(j.check_input(dict(ref, question="q", exposed_output="a")), [])
+        self.assertNotIn("a5_min_help", j.judge_input(dict(ref, a5_min_help=["x"])))
+        self.assertIn("a5_min_help", j.judge_input(dict(merged, question="q")))
 
     def test_fenced_json(self):
         self.assertEqual(j.parse_json('```json\n{"a": 1}\n```'), {"a": 1})
@@ -758,6 +764,19 @@ class ReviewTool(unittest.TestCase):
                                                 human_risk_labels="r12, R07"), rec)
         self.assertEqual((ok, review["risk_labels"]), ([], ["R07", "R12"]))
         self.assertEqual(self.review.final_from_human("nonrefusal", "PASS", "REFUSED"), "FAIL")
+        err = judged("e#1", "generation", "ERROR", None, None, error_code="API_ERROR")
+        problems, _ = self.review.check_row({"case_id": "e#1", "input_sha": "sha-e#1",
+                                             "judge_version": j.JUDGE_VERSION, "reviewer": "王五",
+                                             "human_content_result": "PASS"}, err)
+        self.assertTrue(any("ERROR" in p for p in problems))
+
+    def test_duplicate_rows_are_both_reported(self):
+        row = {"case_id": "g#1", "input_sha": "sha-g#1", "judge_version": j.JUDGE_VERSION,
+               "human_content_result": "PASS", "reviewer": "张三"}
+        final, report = self.review.apply_review(self.recs, [dict(row), dict(row, note="改")])
+        self.assertEqual(report["applied"], 0)
+        self.assertEqual(sorted(p["line"] for p in report["rejected"]), [2, 3])
+        self.assertEqual({r["case_id"]: r for r in final}["g#1"]["final"]["source"], "judge")
 
 
 class Report(unittest.TestCase):

@@ -106,6 +106,8 @@ def check_row(row, rec):
     """Return (problems, review) for one filled-in row."""
     get = lambda k: (row.get(k) or "").strip()  # noqa: E731
     problems = []
+    if rec.get("decision") == "ERROR":
+        problems.append(f"该记录为ERROR（{rec.get('error_code')}），没有评审结论，应用judge.py --resume重评，不能人工填写")
     if get("input_sha") != (rec.get("input_sha") or ""):
         problems.append("input_sha与结果记录不一致（结果或输入已变化）")
     if rec.get("evaluation_sha") and get("evaluation_sha") != rec["evaluation_sha"]:
@@ -151,8 +153,11 @@ def apply_review(recs, rows):
             problems.append({"line": i, "case_id": cid, "problems": ["case_id不在结果中"]})
             continue
         if cid in seen:
-            problems.append({"line": i, "case_id": cid, "problems": [f"与第{seen[cid]}行重复"]})
-            reviews.pop(cid, None)
+            problems.append({"line": i, "case_id": cid, "problems": [f"与第{seen[cid]}行重复，该case_id不写回"]})
+            if reviews.pop(cid, None) is not None:
+                # the first row had passed its checks: say why it is not applied either
+                problems.append({"line": seen[cid], "case_id": cid,
+                                 "problems": [f"与第{i}行重复，该case_id不写回"]})
             continue
         seen[cid] = i
         p, review = check_row(row, by_id[cid])

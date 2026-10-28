@@ -472,7 +472,7 @@ class ClientRetries(unittest.TestCase):
         later = email.utils.formatdate(time.time() + 20, usegmt=True)
         self.assertTrue(15 <= j.retry_after_s(hdr(later)) <= 21)
         with mock.patch.object(j.random, "uniform", return_value=1.5):
-            self.assertEqual(j.backoff_s(1, 999), j.RETRY_WAIT_MAX_S)
+            self.assertEqual(j.backoff_s(1, 999), 999)
             self.assertEqual(j.backoff_s(2), 9.0)
 
     def test_total_deadline(self):
@@ -714,10 +714,13 @@ class ReviewTool(unittest.TestCase):
                      judged("n#1", "nonrefusal", "PENDING", "PASS", "PENDING"),
                      judged("r#1", "refusal", "PASS", "PASS", "REFUSED"),
                      judged("e#1", "generation", "ERROR", None, None, error_code="API_ERROR")]
+        self.cases = [{"case_id": r["case_id"], "bank": r["bank"], "question": "问", "exposed_output": "答"}
+                      for r in self.recs]
+        for rec, case in zip(self.recs, self.cases):
+            rec["input_sha"] = j.input_sha(case)
 
     def test_export(self):
-        cases = [{"case_id": "g#1", "question": "问", "exposed_output": "答"}]
-        rows = self.review.export_rows(self.recs, cases)
+        rows = self.review.export_rows(self.recs, self.cases)
         self.assertEqual([(r["case_id"], r["review_scope"]) for r in rows], [("g#1", "FAIL"), ("n#1", "PENDING")])
         self.assertEqual((rows[0]["question"], rows[0]["answer"], rows[0]["reviewer"]), ("问", "答", ""))
         rows = self.review.export_rows(self.recs, sample_pass=5)

@@ -157,9 +157,10 @@ def main():
     p2 = (HERE / "archive" / "prompt_v2.txt").read_text(encoding="utf-8")
     p3, sha3 = j.load_prompt()
     req = config.get("request", {})
+    max_requests = args.max_requests if args.max_requests is not None else config.get("max_requests_per_batch")
     client = j.Client(model=req.get("model"), max_tokens=req.get("max_tokens", 16000),
                       temperature=req.get("temperature", 0),
-                      budget=j.HttpBudget(args.max_requests) if args.max_requests else None)
+                      budget=j.HttpBudget(max_requests) if max_requests is not None else None)
     params = j.judge_params(config, config_sha, client)
 
     jobs = [(v, c, r) for v in args.versions.split(",") for c in cases for r in range(args.runs)]

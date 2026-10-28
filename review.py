@@ -5,7 +5,8 @@
 
 export writes the FAIL and PENDING records (plus, with --sample-pass, a fixed
 random sample of PASS records for spot checks) to a CSV that opens in Excel;
---cases adds the question and answer text. ERROR records are not exported:
+--cases adds the question and answer text after verifying the input hash and
+unique case IDs; mismatched or missing cases abort export. ERROR records are not exported:
 they need a rerun (judge.py --resume), not a review. Reviewers fill in:
 
     human_content_result  PASS / FAIL (the 31 risks)
@@ -16,9 +17,10 @@ they need a rerun (judge.py --resume), not a review. Reviewers fill in:
 
 apply copies every record of out.jsonl to final.jsonl. A reviewed row adds a
 review block (the human verdict next to the judge's original conclusions) and
-the record's final block takes the human verdict; every other record's final
-block repeats the judge's conclusions. Rows are rejected, and listed, when the
-case_id is unknown or repeated, the input_sha or judge_version no longer match
+the record's final block takes the human verdict; every other record retains
+its existing final block, or uses the judge's conclusions if no final exists.
+Rows are rejected, and listed, when the case_id is unknown or repeated, the
+input_sha, evaluation_sha (when recorded), or judge_version no longer match
 the record, a verdict is filled without a reviewer, or a value is invalid.
 report.py reads the final block.
 """
@@ -30,10 +32,12 @@ import sys
 import time
 from collections import Counter
 
+from judge import input_sha
+
 CODES = {f"R{i:02d}" for i in range(1, 32)}
 HUMAN_COLUMNS = ("human_content_result", "human_refusal_result", "human_risk_labels", "reviewer",
                  "reviewed_at", "note")
-JUDGE_COLUMNS = ("case_id", "input_sha", "judge_version", "bank", "review_scope", "decision", "content_result",
+JUDGE_COLUMNS = ("case_id", "input_sha", "evaluation_sha", "judge_version", "bank", "review_scope", "decision", "content_result",
                  "refusal_result", "risk_labels", "fail_reasons", "hold_reasons", "reason", "evidence", "pending")
 REFUSAL_BANKS = ("refusal", "nonrefusal")
 
@@ -44,7 +48,12 @@ def read_jsonl(path):
 
 
 def export_rows(recs, cases=None, sample_pass=0, seed=1):
-    texts = {c["case_id"]: c for c in cases or []}
+    texts = {}
+    for c in cases or []:
+        cid = c.get("case_id") if isinstance(c, dict) else None
+        if not isinstance(cid, str) or not cid.strip() or cid in texts:
+            raise ValueError(f"cases含非法或重复case_id: {cid!r}")
+        texts[cid] = c
     chosen = [(r, r["decision"]) for r in recs if r["decision"] in ("FAIL", "PENDING")]
     passes = [r for r in recs if r["decision"] == "PASS"]
     if sample_pass:
@@ -53,7 +62,13 @@ def export_rows(recs, cases=None, sample_pass=0, seed=1):
     rows = []
     for r, scope in sorted(chosen, key=lambda x: x[0]["case_id"]):
         c = texts.get(r["case_id"], {})
+        if cases is not None:
+            if not c:
+                raise ValueError(f"cases缺少case_id: {r['case_id']!r}")
+            if input_sha(c) != r.get("input_sha"):
+                raise ValueError(f"case_id {r['case_id']!r} 的input_sha与评审记录不一致")
         row = {"case_id": r["case_id"], "input_sha": r.get("input_sha") or "",
+               "evaluation_sha": r.get("evaluation_sha") or "",
                "judge_version": r.get("judge_version") or "", "bank": r.get("bank") or "",
                "review_scope": scope, "decision": r["decision"],
                "content_result": r.get("content_result") or "", "refusal_result": r.get("refusal_result") or "",
@@ -93,6 +108,8 @@ def check_row(row, rec):
     problems = []
     if get("input_sha") != (rec.get("input_sha") or ""):
         problems.append("input_sha与结果记录不一致（结果或输入已变化）")
+    if rec.get("evaluation_sha") and get("evaluation_sha") != rec["evaluation_sha"]:
+        problems.append("evaluation_sha与结果记录不一致（评审输入或设置已变化）")
     if get("judge_version") != (rec.get("judge_version") or ""):
         problems.append("judge_version与结果记录不一致")
     if not get("reviewer"):
@@ -153,7 +170,7 @@ def apply_review(recs, rows):
             r["final"] = {"decision": final_from_human(r.get("bank"), review["content_result"], review["refusal_result"]),
                           "content_result": review["content_result"], "refusal_result": review["refusal_result"],
                           "risk_labels": review["risk_labels"], "source": "human"}
-        else:
+        elif not r.get("final"):
             r["final"] = {"decision": r["decision"], "content_result": r.get("content_result"),
                           "refusal_result": r.get("refusal_result"), "risk_labels": r.get("risk_labels") or [],
                           "source": "judge"}
@@ -177,7 +194,11 @@ def main():
     args = ap.parse_args()
     recs = read_jsonl(args.out)
     if args.cmd == "export":
-        rows = export_rows(recs, read_jsonl(args.cases) if args.cases else None, args.sample_pass, args.seed)
+        try:
+            rows = export_rows(recs, read_jsonl(args.cases) if args.cases else None, args.sample_pass, args.seed)
+        except ValueError as ex:
+            print(json.dumps({"error": str(ex)}, ensure_ascii=False))
+            return 2
         write_csv(args.csv, rows)
         print(json.dumps({"exported": len(rows), "scope": dict(Counter(r["review_scope"] for r in rows)),
                           "errors_not_exported": sum(r["decision"] == "ERROR" for r in recs)}, ensure_ascii=False))

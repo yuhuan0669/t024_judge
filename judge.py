@@ -47,7 +47,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-JUDGE_VERSION = "t024-judge-v3.8"  # keep in step with the git tag
+JUDGE_VERSION = "t024-judge-v3.8.1"  # keep in step with the git tag
 PROMPT_PATH = Path(__file__).with_name("prompt.txt")
 SERVICE_PATH = Path(__file__).with_name("service_a5.json")
 CONFIG_PATH = Path(__file__).with_name("judge_config.json")
@@ -68,6 +68,8 @@ MAX_TOKENS_CAP = 32000
 CALL_FIELDS = ("model", "finish_reason", "max_tokens", "prompt_tokens", "completion_tokens",
                "reasoning_tokens", "secs", "failed_attempts", "content", "reasoning")
 INPUT_KEYS = ("bank", "question", "exposed_output", "visible_reasoning")
+JUDGE_INPUT_KEYS = ("case_id", "bank", "a5_applicability", "service_profile", "a5_min_help",
+                    "question", "exposed_output", "visible_reasoning")
 
 # Retries: up to 3 attempts per call. 429 / 5xx / timeouts / dropped
 # connections are retried after an exponential backoff with random jitter
@@ -111,6 +113,24 @@ def input_sha(inp):
     for a changed answer."""
     payload = json.dumps({k: inp.get(k) for k in INPUT_KEYS}, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def judge_input(inp):
+    """The effective input sent to the judge, excluding comparison-only fields."""
+    return {k: inp[k] for k in JUDGE_INPUT_KEYS if k in inp}
+
+
+def evaluation_sha(inp, prompt_sha, service_sha, params):
+    """Bind a verdict to its effective input, rules and actual request settings.
+
+    The content-only input_sha remains usable for joining raw question/answer
+    files. Resume additionally requires this complete fingerprint; old records
+    without it cannot establish that their evaluation settings are unchanged.
+    """
+    payload = {"input": judge_input(inp), "judge_version": JUDGE_VERSION,
+               "prompt_sha": prompt_sha, "service_sha": service_sha, "judge_params": params}
+    data = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
 
 def check_policy(policy):
@@ -398,7 +418,8 @@ def retry_after_s(e):
     if not value:
         return None
     try:
-        return max(0.0, float(value))
+        seconds = float(value)
+        return max(0.0, seconds) if math.isfinite(seconds) else None
     except ValueError:
         pass
     try:
@@ -408,11 +429,12 @@ def retry_after_s(e):
 
 
 def backoff_s(attempt, retry_after=None):
-    """Exponential backoff with +-50% jitter, at least Retry-After, at most RETRY_WAIT_MAX_S."""
+    """Cap local exponential backoff, but never shorten the server's minimum wait."""
     wait = RETRY_BASE_S * 2 ** (attempt - 1) * random.uniform(0.5, 1.5)
+    wait = min(wait, RETRY_WAIT_MAX_S)
     if retry_after is not None:
         wait = max(wait, retry_after)
-    return min(wait, RETRY_WAIT_MAX_S)
+    return wait
 
 
 class Client:
@@ -459,8 +481,30 @@ class Client:
             last = attempt == MAX_ATTEMPTS
             try:
                 data = json.loads(self._read(req, t0).decode("utf-8"))
+                if not isinstance(data, dict) or not isinstance(data.get("choices"), list):
+                    raise ValueError("响应须为含choices数组的对象")
                 choice = data["choices"][0]
+                if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
+                    raise ValueError("choices[0]须包含message对象")
                 msg = choice["message"]
+                for field in ("content", "reasoning_content"):
+                    if msg.get(field) is not None and not isinstance(msg[field], str):
+                        raise ValueError(f"message.{field}须为字符串或null")
+                usage = data.get("usage")
+                usage = {} if usage is None else usage
+                if not isinstance(usage, dict):
+                    raise ValueError("usage须为对象或null")
+                details = usage.get("completion_tokens_details")
+                details = {} if details is None else details
+                if not isinstance(details, dict):
+                    raise ValueError("completion_tokens_details须为对象或null")
+                response = {"content": msg.get("content") or "",
+                            "reasoning": msg.get("reasoning_content") or "",
+                            "finish_reason": choice.get("finish_reason"), "model": data.get("model"),
+                            "max_tokens": body["max_tokens"],
+                            "prompt_tokens": usage.get("prompt_tokens", 0),
+                            "completion_tokens": usage.get("completion_tokens", 0),
+                            "reasoning_tokens": details.get("reasoning_tokens", 0)}
                 break
             except urllib.error.HTTPError as e:
                 retryable = e.code == 429 or e.code >= 500
@@ -477,17 +521,8 @@ class Client:
                 failed.append(_attempt(attempt, t0, "bad_response", f"响应格式异常: {type(e).__name__}: {e}", None))
                 raise ApiError(failed[-1]["error"], failed)
             time.sleep(wait)
-        usage = data.get("usage") or {}
-        return {"content": msg.get("content") or "",
-                "reasoning": msg.get("reasoning_content") or "",
-                "finish_reason": choice.get("finish_reason"),
-                "model": data.get("model"),
-                "max_tokens": body["max_tokens"],
-                "prompt_tokens": usage.get("prompt_tokens", 0),
-                "completion_tokens": usage.get("completion_tokens", 0),
-                "reasoning_tokens": (usage.get("completion_tokens_details") or {}).get("reasoning_tokens", 0),
-                "secs": round(time.time() - t0, 1),
-                "failed_attempts": failed}
+        response.update(secs=round(time.time() - t0, 1), failed_attempts=failed)
+        return response
 
 
 def _attempt(n, t0, kind, error, wait):
@@ -525,6 +560,8 @@ def judge_params(config, config_sha, client):
     only the prompt changed."""
     req = config.get("request", {})
     return {"model": client.model, "temperature": client.temperature,
+            # Bind the gateway without persisting URL credentials or query tokens.
+            "endpoint_sha": hashlib.sha256(client.base.encode("utf-8")).hexdigest(),
             "max_tokens": client.max_tokens,
             "max_tokens_cap": req.get("max_tokens_cap", MAX_TOKENS_CAP),
             "response_format": req.get("response_format", "json_object"),
@@ -575,6 +612,7 @@ def new_record(inp, prompt_sha, service_sha, params=None):
     inp = inp if isinstance(inp, dict) else {}
     return {"case_id": inp.get("case_id"), "bank": inp.get("bank"),
             "a5_applicability": inp.get("a5_applicability"), "input_sha": input_sha(inp) if inp else None,
+            "evaluation_sha": evaluation_sha(inp, prompt_sha, service_sha, params) if inp else None,
             "judge_version": JUDGE_VERSION, "prompt_sha": prompt_sha, "service_sha": service_sha,
             "judge_params": params, "served_model": None, "repairs": 0,
             "calls": [], "warnings": [], "errors": []}
@@ -605,8 +643,7 @@ def _judge(inp, client, prompt, max_repairs, approved_models, params, policy, re
     if not (inp.get("exposed_output") or "").strip():
         return as_error(rec, "EMPTY_OUTPUT", "被测输出为空")
 
-    user = {k: inp[k] for k in ("case_id", "bank", "a5_applicability", "service_profile", "a5_min_help",
-                                "question", "exposed_output", "visible_reasoning") if k in inp}
+    user = judge_input(inp)
     messages = [{"role": "system", "content": prompt},
                 {"role": "user", "content": json.dumps(user, ensure_ascii=False)}]
     out, errors, warnings = None, ["未调用"], []
@@ -686,16 +723,18 @@ def load_previous(out_path):
     return prev
 
 
-def reusable(prev, case, versions):
+def reusable(prev, case, versions, params=None):
     """An earlier record is kept only when it is not an ERROR and was made from
     the same input by the same judge version, prompt, service config and
     request config; anything else is judged again."""
-    if prev is None or prev.get("decision") == "ERROR" or prev.get("input_sha") != input_sha(case):
+    if prev is None or prev.get("decision") not in ("PASS", "FAIL", "PENDING") \
+            or prev.get("input_sha") != input_sha(case):
         return False
     seen = {"judge_version": prev.get("judge_version"), "prompt_sha": prev.get("prompt_sha"),
             "service_sha": prev.get("service_sha"),
             "config_sha": (prev.get("judge_params") or {}).get("config_sha")}
-    return seen == versions
+    return seen == versions and prev.get("evaluation_sha") == evaluation_sha(
+        case, versions["prompt_sha"], versions["service_sha"], params)
 
 
 def run_batch(lines, client, prompt, prompt_sha, service, service_sha, out_path, workers=4,
@@ -729,8 +768,12 @@ def run_batch(lines, client, prompt, prompt_sha, service, service_sha, out_path,
         if not isinstance(case, dict):
             parsed.append((seq, None, f"第{seq}行不是JSON对象"))
             continue
-        parsed.append((seq, case, None))
-    id_counts = Counter(c.get("case_id") for _, c, _ in parsed if c is not None)
+        cid = case.get("case_id")
+        if not isinstance(cid, str) or not cid.strip():
+            parsed.append((seq, case, f"case_id缺失或不是非空字符串: {cid!r}"))
+            continue
+        parsed.append((seq, apply_service(case, service), None))
+    id_counts = Counter(c["case_id"] for _, c, problem in parsed if problem is None)
 
     versions = {"judge_version": JUDGE_VERSION, "prompt_sha": prompt_sha, "service_sha": service_sha,
                 "config_sha": (params or {}).get("config_sha")}
@@ -747,7 +790,7 @@ def run_batch(lines, client, prompt, prompt_sha, service, service_sha, out_path,
                                          problem), seq=seq))
             continue
         old = prev.pop(case.get("case_id"), None)
-        if reusable(old, case, versions):
+        if reusable(old, case, versions, params):
             kept.append(dict(old, seq=seq, reused=True))
         else:
             if old is not None:
@@ -774,7 +817,7 @@ def run_batch(lines, client, prompt, prompt_sha, service, service_sha, out_path,
 
         for rec in invalid:
             emit(rec)
-        futures = {pool.submit(judge, apply_service(case, service), client, prompt, prompt_sha,
+        futures = {pool.submit(judge, case, client, prompt, prompt_sha,
                                max_repairs=max_repairs, service_sha=service_sha,
                                approved_models=approved_models, params=params, policy=policy): seq
                    for seq, case in todo}

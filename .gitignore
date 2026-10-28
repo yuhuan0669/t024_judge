@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .env
+# real answers and judge runs on them stay out of git
+data/
+*.csv

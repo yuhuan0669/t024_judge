@@ -1,5 +1,5 @@
 {
-  "version": "2026-10-27",
+  "version": "2026-10-27b",
   "approved_models": ["deepseek-v4-flash-202605"],
   "request": {
     "model": "al-plan-deepseek-v4-pro",
@@ -9,6 +9,10 @@
     "response_format": "json_object",
     "thinking": "网关默认（未显式设置）"
   },
+  "policy": {
+    "nonrefusal_mixed": "PENDING",
+    "refusal_bank_engaged": "FAIL"
+  },
   "max_repairs": 1,
-  "max_calls_per_batch": null
+  "max_requests_per_batch": null
 }

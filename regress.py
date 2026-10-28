@@ -10,6 +10,7 @@ without expect_decision (e.g. samples taken from a test bank to see how the
 judge copes) are run and reported but not scored.
 """
 import argparse
+import hashlib
 import json
 import time
 from collections import defaultdict
@@ -54,7 +55,8 @@ def run_v2(case, client, prompt):
 def run_v3(case, client, prompt, sha, service_sha, config, params):
     inp = {k: v for k, v in case.items() if not k.startswith(("expect_", "allow_"))}
     rec = j.judge(inp, client, prompt, sha, max_repairs=config.get("max_repairs", 1),
-                  service_sha=service_sha, approved_models=config.get("approved_models"), params=params)
+                  service_sha=service_sha, approved_models=config.get("approved_models"), params=params,
+                  policy=config["policy"])
     c = rec.get("checks") or {}
     rec["a5_pattern"] = f"a5={case.get('a5_applicability')}(输入),R30={c.get('R30')},R31={c.get('R31')}"
     rec["issues"] = rec.get("errors") or ([rec["error_code"]] if rec.get("error_code") else [])
@@ -79,10 +81,20 @@ def is_correct(rec, case):
 
 
 def load_cases(path):
+    """Load cases; a case without case_id gets a deterministic temporary one
+    (position plus a hash of question and answer). Formal runs through
+    judge.py require real, unique case_ids instead."""
     text = Path(path).read_text(encoding="utf-8")
     if str(path).endswith(".jsonl"):
-        return [json.loads(l) for l in text.splitlines() if l.strip()]
-    return json.loads(text)
+        cases = [json.loads(l) for l in text.splitlines() if l.strip()]
+    else:
+        cases = json.loads(text)
+    for i, c in enumerate(cases, 1):
+        if not c.get("case_id"):
+            digest = hashlib.sha1((str(c.get("question")) + "\0" + str(c.get("exposed_output")))
+                                  .encode("utf-8")).hexdigest()[:8]
+            c["case_id"] = f"auto-{i:04d}-{digest}"
+    return cases
 
 
 def shown_decision(r):
@@ -131,6 +143,7 @@ def main():
     ap.add_argument("--summarize", help="only rebuild the markdown table from an existing results json")
     ap.add_argument("--versions", default="v3")
     ap.add_argument("--cases", default=str(HERE / "cases_regress.json"))
+    ap.add_argument("--max-requests", type=int, help="cap on HTTP requests for this run")
     args = ap.parse_args()
     if args.summarize:
         src = Path(args.summarize)
@@ -145,7 +158,8 @@ def main():
     p3, sha3 = j.load_prompt()
     req = config.get("request", {})
     client = j.Client(model=req.get("model"), max_tokens=req.get("max_tokens", 16000),
-                      temperature=req.get("temperature", 0))
+                      temperature=req.get("temperature", 0),
+                      budget=j.HttpBudget(args.max_requests) if args.max_requests else None)
     params = j.judge_params(config, config_sha, client)
 
     jobs = [(v, c, r) for v in args.versions.split(",") for c in cases for r in range(args.runs)]
@@ -177,7 +191,9 @@ def main():
     summary = summarize(recs)
     (out_dir / f"regress_{stamp}.md").write_text(summary + "\n", encoding="utf-8")
     print(summary)
-    print(f"wall {time.time() - t0:.0f}s; served models: {sorted(set(str(c.get('model')) for r in recs for c in r['calls']))}; "
+    requests = client.budget.used if client.budget else sum(j.http_requests(r) for r in recs)
+    print(f"wall {time.time() - t0:.0f}s; http requests: {requests}; "
+          f"served models: {sorted(set(str(c.get('model')) for r in recs for c in r['calls']))}; "
           f"params: {json.dumps(params, ensure_ascii=False)}")
 
 

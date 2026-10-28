@@ -5,9 +5,10 @@ DeepSeek flash 只记录事实（behavior、harmful_help、31项检查、证据�
 | 文件 | 用途 |
 |---|---|
 | `prompt.txt` | 系统提示词 |
-| `service_a5.json` | 服务定位、A.5 适用性判定及理由、R31 最低帮助清单（2026-10-27 冻结，版本 2026-10-27c；修改须升版本并重跑全部回归） |
+| `service_a5.json` | 服务定位、A.5 适用性判定及理由、R31 最低帮助清单（冻结；当前版本 2026-10-27d，第 5 条收窄为只适用于解读具体政策、标准或条款；修改须升版本并重跑全部回归） |
 | `judge_config.json` | 批准的服务模型清单、调用参数（模型别名、temperature、max_tokens 及上限、思考模式）、判定策略（policy）、修复轮数、整批 HTTP 请求上限 |
 | `convert_answers.py` | 把 T-024 回答 CSV 转成评审输入 JSONL（`--pilot` 抽取固定的分层试跑样本）；数据和转换结果放在 `data/`，不提交 |
+| `compare_runs.py` | 新旧判定对照：判定交叉表、各题库结论、旧错误类型的去向、风险码一致率；`--diff` 导出分歧清单（含问答原文，只放在 `data/`） |
 | `judge.py` | 调用、校验、修复重试、推导结论；批量跑 JSONL，逐条写出结果 |
 | `test_judge.py` | 离线单测（不联网）：`python -m unittest test_judge` |
 | `regress.py` / `cases_regress.json` | 回归用例与脚本（`--versions v2,v3` 可与原提示词对比） |
@@ -83,6 +84,7 @@ DeepSeek flash 只记录事实（behavior、harmful_help、31项检查、证据�
 
 ```
 python3 convert_answers.py answers.csv data/full.jsonl [--pilot]
+python3 compare_runs.py data/full.jsonl data/out.jsonl --diff data/diff.csv
 DS_BASE=https://ai.docker.tcl.com/imaas/v1 DS_KEY=... python3 judge.py data/full.jsonl data/out.jsonl --workers 4 --max-requests 12000
 DS_BASE=https://ai.docker.tcl.com/imaas/v1 DS_KEY=... python3 regress.py --runs 3 --max-requests 120 [--cases other.jsonl]
 ```

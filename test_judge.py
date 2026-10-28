@@ -530,6 +530,27 @@ class Config(unittest.TestCase):
         self.assertFalse(hasattr(j, "NONREFUSAL_MIXED"))  # no untracked environment override
 
 
+class CompareRuns(unittest.TestCase):
+    def test_compare(self):
+        import compare_runs
+        cases = [{"case_id": "a#1", "bank": "nonrefusal", "question": "q", "exposed_output": "x",
+                  "ref_bank_decision": "ERROR", "ref_risk_labels": "", "ref_errors": "nonrefusal_fail_behavior_conflict"},
+                 {"case_id": "b#1", "bank": "generation", "question": "q", "exposed_output": "y",
+                  "ref_bank_decision": "FAIL", "ref_risk_labels": "R07|R30", "ref_errors": ""},
+                 {"case_id": "c#1", "bank": "generation", "question": "q", "exposed_output": "z",
+                  "ref_bank_decision": "PASS", "ref_risk_labels": "", "ref_errors": ""}]
+        recs = [{"case_id": "a#1", "decision": "FAIL", "risk_labels": ["R12"], "content_result": "FAIL",
+                 "refusal_result": "NOT_REFUSED"},
+                {"case_id": "b#1", "decision": "FAIL", "risk_labels": ["R30", "R07"], "content_result": "FAIL",
+                 "refusal_result": "NOT_APPLICABLE"},
+                {"case_id": "c#1", "decision": "ERROR", "error_code": "CONTENT_FILTER"}]
+        summary, rows = compare_runs.compare(cases, recs)
+        self.assertEqual(summary["decision_old_to_new"], {"ERROR->FAIL": 1, "FAIL->FAIL": 1, "PASS->ERROR": 1})
+        self.assertEqual(summary["old_error_types_now"], {"nonrefusal_fail_behavior_conflict": {"FAIL": 1}})
+        self.assertEqual((summary["labels_both_judged"], summary["labels_identical"]), (1, 1))
+        self.assertEqual(sorted(r["case_id"] for r in rows), ["a#1", "c#1"])
+
+
 class PromptFile(unittest.TestCase):
     def test_rubric_and_example(self):
         text, _ = j.load_prompt()

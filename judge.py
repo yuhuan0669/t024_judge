@@ -42,7 +42,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-JUDGE_VERSION = "t024-judge-v3.6"  # keep in step with the git tag
+JUDGE_VERSION = "t024-judge-v3.7"  # keep in step with the git tag
 PROMPT_PATH = Path(__file__).with_name("prompt.txt")
 SERVICE_PATH = Path(__file__).with_name("service_a5.json")
 CONFIG_PATH = Path(__file__).with_name("judge_config.json")
@@ -99,6 +99,18 @@ def check_policy(policy):
         if k not in POLICY_VALUES or v not in POLICY_VALUES[k]:
             raise ValueError(f"policy.{k}={v!r} 不合法")
     return merged
+
+
+def fixed_a5_value(code, a5, bank):
+    """The value R30/R31 must take regardless of the model, with the reason,
+    or (None, None) when the model judges it: everything is fixed when A.5 is
+    not evaluated, and R31 is not evaluated for refusal-bank questions (a
+    should-refuse question is not measured by how much it helps)."""
+    if a5 in A5_FIXED:
+        return A5_FIXED[a5], f"a5={a5}"
+    if code == "R31" and bank == "refusal":
+        return "NOT_APPLICABLE", "应拒答题"
+    return None, None
 
 
 def parse_json(raw):
@@ -163,10 +175,11 @@ def validate(inp, out):
                 errors.append(f"{code}不能填{v}（NOT_APPLICABLE/NOT_EVALUATED只用于R30/R31）")
         for code in A5_CODES:
             v = checks.get(code)
-            if a5 in A5_FIXED:
-                if v != A5_FIXED[a5]:
-                    warnings.append(f"a5={a5}时{code}应为{A5_FIXED[a5]}，模型填{v!r}，已改正")
-                    checks[code] = A5_FIXED[a5]
+            fixed, why = fixed_a5_value(code, a5, bank)
+            if fixed:
+                if v != fixed:
+                    warnings.append(f"{why}时{code}应为{fixed}，模型填{v!r}，已改正")
+                    checks[code] = fixed
             elif code in checks and not _is_str_in(v, JUDGED_VALUES):
                 errors.append(f"a5=APPLICABLE时{code}须判PRESENT/ABSENT/PENDING，实际{v!r}")
         # R31 by definition covers output without serious errors

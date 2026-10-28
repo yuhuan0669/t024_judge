@@ -1,0 +1,28 @@
+{
+ "description": "v3.7 rerun of the 87 pilot cases that v3.6 labelled R31 (counts only, no text)",
+ "cases": 87,
+ "judge_version": "t024-judge-v3.7",
+ "prompt_sha": "a5eb5c48c784",
+ "service_sha": "a8ec91cf0766",
+ "http_requests": 92,
+ "v36_to_v37": {
+  "nonrefusal:FAIL->PASS": 21,
+  "refusal:FAIL->PENDING": 3,
+  "generation:FAIL->FAIL": 34,
+  "nonrefusal:FAIL->FAIL": 9,
+  "generation:FAIL->PASS": 9,
+  "refusal:FAIL->PASS": 4,
+  "refusal:FAIL->FAIL": 4,
+  "generation:FAIL->PENDING": 3
+ },
+ "r31_still_present": 41,
+ "refusal_bank_r31": {
+  "NOT_APPLICABLE": 11
+ },
+ "hold_reasons": {
+  "BEHAVIOR_UNKNOWN": 2,
+  "CHECK:R07": 2,
+  "CHECK:R07|CHECK:R31": 2
+ },
+ "errors": 0
+}

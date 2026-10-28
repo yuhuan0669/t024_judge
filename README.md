@@ -9,6 +9,8 @@ DeepSeek flash 只记录事实（behavior、harmful_help、31项检查、证据�
 | `judge_config.json` | 批准的服务模型清单、调用参数（模型别名、temperature、max_tokens 及上限、思考模式）、判定策略（policy）、修复轮数、整批 HTTP 请求上限 |
 | `convert_answers.py` | 把 T-024 回答 CSV 转成评审输入 JSONL（`--pilot` 抽取固定的分层试跑样本）；数据和转换结果放在 `data/`，不提交 |
 | `compare_runs.py` | 新旧判定对照：判定交叉表、各题库结论、旧错误类型的去向、风险码一致率；`--diff` 导出分歧清单（含问答原文，只放在 `data/`） |
+| `review.py` | 人工复核：`export` 导出 FAIL / PENDING（可加 PASS 抽查）到 CSV，`apply` 把复核结论写回为 final.jsonl（保留原判，复核人必须由真人填写） |
+| `report.py` | TC260 统计报告：分题库计算生成内容合格率、应拒答题拒答率、非拒答题拒答率（固定分母，含最差/最好区间、按回答和按题两种口径），风险码统计及需复核的标签组合 |
 | `judge.py` | 调用、校验、修复重试、推导结论；批量跑 JSONL，逐条写出结果 |
 | `test_judge.py` | 离线单测（不联网）：`python -m unittest test_judge` |
 | `regress.py` / `cases_regress.json` | 回归用例与脚本（`--versions v2,v3` 可与原提示词对比） |
@@ -20,7 +22,7 @@ DeepSeek flash 只记录事实（behavior、harmful_help、31项检查、证据�
 ## 版本管理
 
 - 文件名不带版本号，版本由 git 记录：每个定稿版本打 tag（如 `v3.1`），改动看 `git log` / `git diff`。
-- `judge.py` 中的 `JUDGE_VERSION` 与 tag 保持一致；每条评审结果都记录 `judge_version`、`prompt_sha`（提示词内容哈希）、`service_sha`（`service_a5.json` 内容哈希）和 `judge_params`（实际调用参数、判定策略及 `judge_config.json` 哈希），可据此对应到具体版本。比较不同版本时先确认 `judge_params` 一致，避免把参数差异当成提示词改进。
+- `judge.py` 中的 `JUDGE_VERSION` 与 tag 保持一致；每条评审结果都记录 `judge_version`、`input_sha`（被评内容哈希）、`prompt_sha`（提示词内容哈希）、`service_sha`（`service_a5.json` 内容哈希）和 `judge_params`（实际调用参数、判定策略及 `judge_config.json` 哈希），可据此对应到具体版本。比较不同版本时先确认 `judge_params` 一致，避免把参数差异当成提示词改进。
 - 改提示词、判定表或 `service_a5.json` 后，跑单测和回归，结果提交到 `results/`，再打新 tag。
 
 ## 输入（每行一个 JSON）
@@ -72,7 +74,16 @@ DeepSeek flash 只记录事实（behavior、harmful_help、31项检查、证据�
 
 ### 原始证据
 
-`calls` 记录每次模型调用（含截断重试和修复轮）：实际服务模型、`finish_reason`、请求的 `max_tokens`、token 用量、耗时、原始输出 `content`、推理过程 `reasoning`、该次调用之前失败的 HTTP 尝试 `failed_attempts`。保存推理过程会让结果文件明显变大（回归一轮约 400KB）。
+`calls` 记录每次模型调用（含截断重试和修复轮）：实际服务模型、`finish_reason`、请求的 `max_tokens`、token 用量、耗时、原始输出 `content`、推理过程 `reasoning`、该次调用之前失败的 HTTP 尝试 `failed_attempts`（每次含类型 `kind`、错误信息和重试前等待的 `wait_s`）。保存推理过程会让结果文件明显变大（回归一轮约 400KB）。
+
+`input_sha` 是被评内容（bank、问题、回答、可见推理）的哈希，用来证明判的就是这条回答，续跑时也据此识别输入是否变过。
+
+### 重试与超时
+
+- 每次调用最多尝试 3 次。429、5xx、超时、连接断开会重试，等待时间按 3 秒、6 秒指数退避，并加 ±50% 随机延迟；网关返回 `Retry-After` 时至少等它要求的时间，单次最长等 60 秒。其他 4xx 不重试。
+- 失败类型（`kind`）：`http_429`、`http_5xx`、`http_4xx`、`timeout`、`connection`、`deadline`、`bad_response`。
+- `timeout_s`（默认 300）是连接和每次读取的超时；`deadline_s`（默认 900）是单次请求的总时限，在两次读取之间检查，防止网关持续发送心跳空行时请求一直挂着。实际最长约为两者之和。
+- 断连或超时可能发生在网关已经处理完之后，重试可能重复计费；每次尝试都单独记录、计入请求预算。
 
 ### 引文校验
 
@@ -84,10 +95,18 @@ DeepSeek flash 只记录事实（behavior、harmful_help、31项检查、证据�
 
 ```
 python3 convert_answers.py answers.csv data/full.jsonl [--pilot]
+DS_BASE=https://ai.docker.tcl.com/imaas/v1 DS_KEY=... python3 judge.py data/full.jsonl data/out.jsonl --workers 8 --max-requests 12000
+DS_BASE=https://ai.docker.tcl.com/imaas/v1 DS_KEY=... python3 judge.py data/full.jsonl data/out.jsonl --workers 8 --max-requests 2000 --resume
 python3 compare_runs.py data/full.jsonl data/out.jsonl --diff data/diff.csv
-DS_BASE=https://ai.docker.tcl.com/imaas/v1 DS_KEY=... python3 judge.py data/full.jsonl data/out.jsonl --workers 4 --max-requests 12000
+python3 review.py export data/out.jsonl data/review.csv --cases data/full.jsonl --sample-pass 100
+python3 review.py apply data/out.jsonl data/review.csv data/final.jsonl
+python3 report.py data/final.jsonl --md data/report.md --json data/report.json
 DS_BASE=https://ai.docker.tcl.com/imaas/v1 DS_KEY=... python3 regress.py --runs 3 --max-requests 120 [--cases other.jsonl]
 ```
+
+- `--resume`：保留同一输出文件中可复用的记录（非 ERROR，且输入哈希、评审版本、提示词、服务配置、调用配置都一致，标记 `reused`），只评缺失、ERROR 和输入变过的样本；被替换的旧记录追加到 `<输出>.superseded.jsonl`。不加 `--resume` 时，已有输出文件先改名为 `<输出>.bak-<时间>`。
+- `judge.py` 结束时打印汇总和本次运行统计（`run`）：耗时、每分钟有效判定数、调用延迟 P50/P95、各类失败尝试数和失败率、ERROR 率。提高并发前，在提示词和参数不变的情况下比较这几项。
+- 默认 8 路并发；网关的并发、QPS 和连接时长限制尚未确认。
 
 新增模型调用须事先说明次数和预算，获得授权后执行，并用 `--max-requests` 把授权额度设为硬上限。
 

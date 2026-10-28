@@ -1,5 +1,5 @@
 {
-  "version": "2026-10-27b",
+  "version": "2026-10-27c",
   "approved_models": ["deepseek-v4-flash-202605"],
   "request": {
     "model": "al-plan-deepseek-v4-pro",
@@ -7,7 +7,9 @@
     "max_tokens": 16000,
     "max_tokens_cap": 32000,
     "response_format": "json_object",
-    "thinking": "网关默认（未显式设置）"
+    "thinking": "网关默认（未显式设置）",
+    "timeout_s": 300,
+    "deadline_s": 900
   },
   "policy": {
     "nonrefusal_mixed": "PENDING",

@@ -12,12 +12,12 @@ incomplete response, content filter, request budget used up, output that never
 validated). ERROR carries error_code and is kept apart from PENDING, which only
 means a semantic fact still has to be confirmed.
 
-Every record keeps the request parameters and decision policy (judge_params)
-and, per model call, the raw content, the reasoning and any failed HTTP
-attempts.
+Every record keeps the request parameters and decision policy (judge_params),
+a hash of the judged input (input_sha) and, per model call, the raw content,
+the reasoning and every failed HTTP attempt with its kind.
 
 Usage:
-    DS_BASE=... DS_KEY=... python3 judge.py cases.jsonl out.jsonl [--workers 4] [--max-requests N]
+    DS_BASE=... DS_KEY=... python3 judge.py cases.jsonl out.jsonl [--workers 8] [--max-requests N] [--resume]
 
 Each input line: {"case_id", "bank", "question", "exposed_output",
 "visible_reasoning"?}; case_id must be a unique non-empty string.
@@ -25,13 +25,18 @@ a5_applicability / service_profile / a5_min_help come from the line or, if
 absent, from --service (default service_a5.json). Request parameters, decision
 policy and the approved model list come from --config (default
 judge_config.json). Each record is written to out.jsonl as soon as its case
-finishes.
+finishes; --resume keeps the finished records of an earlier run of the same
+output file and judges only what is missing, failed with ERROR, or changed.
 """
 import argparse
+import email.utils
 import hashlib
 import json
+import math
 import os
+import random
 import re
+import socket
 import sys
 import threading
 import time
@@ -42,7 +47,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-JUDGE_VERSION = "t024-judge-v3.7"  # keep in step with the git tag
+JUDGE_VERSION = "t024-judge-v3.8"  # keep in step with the git tag
 PROMPT_PATH = Path(__file__).with_name("prompt.txt")
 SERVICE_PATH = Path(__file__).with_name("service_a5.json")
 CONFIG_PATH = Path(__file__).with_name("judge_config.json")
@@ -62,6 +67,14 @@ QUOTE_MAX = 80
 MAX_TOKENS_CAP = 32000
 CALL_FIELDS = ("model", "finish_reason", "max_tokens", "prompt_tokens", "completion_tokens",
                "reasoning_tokens", "secs", "failed_attempts", "content", "reasoning")
+INPUT_KEYS = ("bank", "question", "exposed_output", "visible_reasoning")
+
+# Retries: up to 3 attempts per call. 429 / 5xx / timeouts / dropped
+# connections are retried after an exponential backoff with random jitter
+# (honouring Retry-After when the gateway sends one); other 4xx are not.
+MAX_ATTEMPTS = 3
+RETRY_BASE_S = 3
+RETRY_WAIT_MAX_S = 60
 
 # Decision policy, normally taken from judge_config.json "policy".
 # nonrefusal_mixed: how a nonrefusal answer that refuses part of a legitimate
@@ -90,6 +103,14 @@ def _is_str_in(value, allowed):
     # model output may put lists or numbers anywhere; never let them reach a
     # set lookup, which raises TypeError for unhashable values
     return isinstance(value, str) and value in allowed
+
+
+def input_sha(inp):
+    """Hash of what is judged (bank, question, answer, visible reasoning), so a
+    record can be matched to its input and a resumed run never reuses a result
+    for a changed answer."""
+    payload = json.dumps({k: inp.get(k) for k in INPUT_KEYS}, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def check_policy(policy):
@@ -336,6 +357,10 @@ class BudgetExceeded(ApiError):
     pass
 
 
+class DeadlineExceeded(TimeoutError):
+    pass
+
+
 class HttpBudget:
     """Batch-wide cap on HTTP requests to the gateway. Checked before every
     request is sent, so first tries, retries after failures, repair turns and
@@ -354,16 +379,69 @@ class HttpBudget:
             return True
 
 
+def failure_kind(e):
+    """http_429 / http_5xx / http_4xx / deadline / timeout / connection."""
+    if isinstance(e, urllib.error.HTTPError):
+        return "http_429" if e.code == 429 else "http_5xx" if e.code >= 500 else "http_4xx"
+    if isinstance(e, DeadlineExceeded):
+        return "deadline"
+    timeouts = (TimeoutError, socket.timeout)
+    if isinstance(e, timeouts) or isinstance(getattr(e, "reason", None), timeouts):
+        return "timeout"
+    return "connection"
+
+
+def retry_after_s(e):
+    """Seconds asked for by a Retry-After header (delta-seconds or HTTP date)."""
+    headers = getattr(e, "headers", None)
+    value = headers.get("Retry-After") if headers is not None else None
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        return max(0.0, email.utils.parsedate_to_datetime(value).timestamp() - time.time())
+    except (TypeError, ValueError):
+        return None
+
+
+def backoff_s(attempt, retry_after=None):
+    """Exponential backoff with +-50% jitter, at least Retry-After, at most RETRY_WAIT_MAX_S."""
+    wait = RETRY_BASE_S * 2 ** (attempt - 1) * random.uniform(0.5, 1.5)
+    if retry_after is not None:
+        wait = max(wait, retry_after)
+    return min(wait, RETRY_WAIT_MAX_S)
+
+
 class Client:
+    """timeout: socket timeout for connecting and for each read; deadline:
+    total seconds for one request, checked between reads, because keep-alive
+    blank lines would otherwise keep a stuck request alive indefinitely."""
+
     def __init__(self, base=None, key=None, model=None, max_tokens=16000, temperature=0, timeout=300,
-                 budget=None):
+                 deadline=900, budget=None):
         self.base = (base or os.environ["DS_BASE"]).rstrip("/")
         self.key = key or os.environ["DS_KEY"]
         self.model = model or os.environ.get("DS_MODEL", "al-plan-deepseek-v4-pro")
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.timeout = timeout
+        self.deadline = deadline
         self.budget = budget
+
+    def _read(self, req, t0):
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            read = getattr(r, "read1", None) or r.read
+            chunks = []
+            while True:
+                if time.time() - t0 > self.deadline:
+                    raise DeadlineExceeded(f"超过单次请求总时限{self.deadline}秒")
+                chunk = read(65536)
+                if not chunk:
+                    return b"".join(chunks)
+                chunks.append(chunk)
 
     def chat(self, messages, max_tokens=None):
         body = {"model": self.model, "temperature": self.temperature,
@@ -374,28 +452,31 @@ class Client:
             self.base + "/chat/completions", data=json.dumps(body).encode("utf-8"),
             headers={"Authorization": "Bearer " + self.key, "Content-Type": "application/json"})
         failed = []
-        for attempt in range(1, 4):
+        for attempt in range(1, MAX_ATTEMPTS + 1):
             if self.budget is not None and not self.budget.take():
                 raise BudgetExceeded(f"本批HTTP请求已达上限{self.budget.max_requests}", failed)
             t0 = time.time()
+            last = attempt == MAX_ATTEMPTS
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                    data = json.loads(r.read().decode("utf-8"))
+                data = json.loads(self._read(req, t0).decode("utf-8"))
                 choice = data["choices"][0]
                 msg = choice["message"]
                 break
             except urllib.error.HTTPError as e:
-                failed.append(_attempt(attempt, t0, f"HTTP {e.code}: {_error_body(e)}"))
-                if e.code < 500 and e.code != 429 or attempt == 3:
+                retryable = e.code == 429 or e.code >= 500
+                wait = backoff_s(attempt, retry_after_s(e)) if retryable and not last else None
+                failed.append(_attempt(attempt, t0, failure_kind(e), f"HTTP {e.code}: {_error_body(e)}", wait))
+                if wait is None:
                     raise ApiError(failed[-1]["error"], failed)
-            except OSError as e:  # URLError, timeouts, connection resets
-                failed.append(_attempt(attempt, t0, f"{type(e).__name__}: {e}"))
-                if attempt == 3:
+            except OSError as e:  # URLError, timeouts, dropped connections, the total deadline
+                wait = None if last else backoff_s(attempt)
+                failed.append(_attempt(attempt, t0, failure_kind(e), f"{type(e).__name__}: {e}", wait))
+                if wait is None:
                     raise ApiError(failed[-1]["error"], failed)
             except (ValueError, KeyError, IndexError, TypeError) as e:
-                failed.append(_attempt(attempt, t0, f"响应格式异常: {type(e).__name__}: {e}"))
+                failed.append(_attempt(attempt, t0, "bad_response", f"响应格式异常: {type(e).__name__}: {e}", None))
                 raise ApiError(failed[-1]["error"], failed)
-            time.sleep(2 ** (attempt - 1) * 3)
+            time.sleep(wait)
         usage = data.get("usage") or {}
         return {"content": msg.get("content") or "",
                 "reasoning": msg.get("reasoning_content") or "",
@@ -409,8 +490,9 @@ class Client:
                 "failed_attempts": failed}
 
 
-def _attempt(n, t0, error):
-    return {"attempt": n, "secs": round(time.time() - t0, 1), "error": error}
+def _attempt(n, t0, kind, error, wait):
+    return {"attempt": n, "secs": round(time.time() - t0, 1), "kind": kind, "error": error,
+            "wait_s": None if wait is None else round(wait, 1)}
 
 
 def _error_body(e):
@@ -447,6 +529,7 @@ def judge_params(config, config_sha, client):
             "max_tokens_cap": req.get("max_tokens_cap", MAX_TOKENS_CAP),
             "response_format": req.get("response_format", "json_object"),
             "thinking": req.get("thinking"),
+            "timeout_s": client.timeout, "deadline_s": client.deadline,
             "max_repairs": config.get("max_repairs", 1),
             "policy": check_policy(config.get("policy")),
             "approved_models": config.get("approved_models"),
@@ -491,7 +574,7 @@ def check_input(inp):
 def new_record(inp, prompt_sha, service_sha, params=None):
     inp = inp if isinstance(inp, dict) else {}
     return {"case_id": inp.get("case_id"), "bank": inp.get("bank"),
-            "a5_applicability": inp.get("a5_applicability"),
+            "a5_applicability": inp.get("a5_applicability"), "input_sha": input_sha(inp) if inp else None,
             "judge_version": JUDGE_VERSION, "prompt_sha": prompt_sha, "service_sha": service_sha,
             "judge_params": params, "served_model": None, "repairs": 0,
             "calls": [], "warnings": [], "errors": []}
@@ -586,16 +669,52 @@ def _judge(inp, client, prompt, max_repairs, approved_models, params, policy, re
     return rec
 
 
+def load_previous(out_path):
+    """Records of an earlier run of out_path, the last one per case_id. A
+    half-written last line (the run was killed) is skipped."""
+    prev = {}
+    if not os.path.exists(out_path):
+        return prev
+    with open(out_path, encoding="utf-8") as f:
+        for line in f:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(r, dict) and isinstance(r.get("case_id"), str):
+                prev[r["case_id"]] = r
+    return prev
+
+
+def reusable(prev, case, versions):
+    """An earlier record is kept only when it is not an ERROR and was made from
+    the same input by the same judge version, prompt, service config and
+    request config; anything else is judged again."""
+    if prev is None or prev.get("decision") == "ERROR" or prev.get("input_sha") != input_sha(case):
+        return False
+    seen = {"judge_version": prev.get("judge_version"), "prompt_sha": prev.get("prompt_sha"),
+            "service_sha": prev.get("service_sha"),
+            "config_sha": (prev.get("judge_params") or {}).get("config_sha")}
+    return seen == versions
+
+
 def run_batch(lines, client, prompt, prompt_sha, service, service_sha, out_path, workers=4,
-              max_repairs=1, approved_models=None, params=None, policy=None, max_requests=None):
+              max_repairs=1, approved_models=None, params=None, policy=None, max_requests=None,
+              resume=False):
     """Judge every non-empty line and write each record to out_path as soon as
     it is done, so an interrupted run keeps what already finished.
 
     A line that is not a JSON object, or whose case_id is missing or occurs
     more than once in the file, becomes an INVALID_INPUT record. Once
     max_requests HTTP requests have been sent the remaining cases become
-    BUDGET_EXCEEDED. Returns the records; seq is the line number in the input
-    file."""
+    BUDGET_EXCEEDED.
+
+    resume=True keeps the reusable records of an earlier run of out_path
+    (marked reused=True) and judges the rest; the records it replaces are
+    appended to <out_path>.superseded.jsonl so no attempt is lost. Without
+    resume an existing out_path is first renamed to <out_path>.bak-<time>.
+
+    Returns all records (kept and new); seq is the line number in the input."""
     if max_requests is not None:
         client.budget = HttpBudget(max_requests)
     parsed = []
@@ -613,25 +732,52 @@ def run_batch(lines, client, prompt, prompt_sha, service, service_sha, out_path,
         parsed.append((seq, case, None))
     id_counts = Counter(c.get("case_id") for _, c, _ in parsed if c is not None)
 
-    recs = []
-    with open(out_path, "w", encoding="utf-8") as f, ThreadPoolExecutor(workers) as pool:
+    versions = {"judge_version": JUDGE_VERSION, "prompt_sha": prompt_sha, "service_sha": service_sha,
+                "config_sha": (params or {}).get("config_sha")}
+    prev = load_previous(out_path) if resume else {}
+    if not resume and os.path.exists(out_path) and os.path.getsize(out_path):
+        os.replace(out_path, f"{out_path}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+
+    kept, invalid, todo, superseded = [], [], [], []
+    for seq, case, problem in parsed:
+        if case is not None and isinstance(case.get("case_id"), str) and id_counts[case["case_id"]] > 1:
+            problem = f"case_id {case['case_id']!r} 在文件中出现{id_counts[case['case_id']]}次"
+        if problem:
+            invalid.append(dict(as_error(new_record(case, prompt_sha, service_sha, params), "INVALID_INPUT",
+                                         problem), seq=seq))
+            continue
+        old = prev.pop(case.get("case_id"), None)
+        if reusable(old, case, versions):
+            kept.append(dict(old, seq=seq, reused=True))
+        else:
+            if old is not None:
+                superseded.append(old)
+            todo.append((seq, case))
+    superseded.extend(prev.values())  # earlier records for cases no longer in the input
+
+    if superseded:
+        with open(f"{out_path}.superseded.jsonl", "a", encoding="utf-8") as f:
+            for r in superseded:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    tmp = f"{out_path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for r in kept:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    os.replace(tmp, out_path)
+
+    recs = list(kept)
+    with open(out_path, "a", encoding="utf-8") as f, ThreadPoolExecutor(workers) as pool:
         def emit(rec):
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
             f.flush()
             recs.append(rec)
 
-        futures = {}
-        for seq, case, problem in parsed:
-            if case is not None and isinstance(case.get("case_id"), str) and id_counts[case["case_id"]] > 1:
-                problem = f"case_id {case['case_id']!r} 在文件中出现{id_counts[case['case_id']]}次"
-            if problem:
-                emit(dict(as_error(new_record(case, prompt_sha, service_sha, params), "INVALID_INPUT", problem),
-                          seq=seq))
-                continue
-            fut = pool.submit(judge, apply_service(case, service), client, prompt, prompt_sha,
-                              max_repairs=max_repairs, service_sha=service_sha,
-                              approved_models=approved_models, params=params, policy=policy)
-            futures[fut] = seq
+        for rec in invalid:
+            emit(rec)
+        futures = {pool.submit(judge, apply_service(case, service), client, prompt, prompt_sha,
+                               max_repairs=max_repairs, service_sha=service_sha,
+                               approved_models=approved_models, params=params, policy=policy): seq
+                   for seq, case in todo}
         for fut in as_completed(futures):
             emit(dict(fut.result(), seq=futures[fut]))
     return recs
@@ -644,14 +790,28 @@ def http_requests(rec):
             + len(rec.get("failed_attempts") or []))
 
 
+def _failed_attempts(rec):
+    for c in rec.get("calls") or []:
+        yield from c.get("failed_attempts") or []
+    yield from rec.get("failed_attempts") or []
+
+
+def _percentile(values, p):
+    """Nearest-rank percentile."""
+    if not values:
+        return None
+    values = sorted(values)
+    return values[max(0, math.ceil(p / 100 * len(values)) - 1)]
+
+
 def summarize(recs):
     by_bank = {}
     for r in recs:
         if r["decision"] == "ERROR":  # counted under "errors" only
             continue
-        b = by_bank.setdefault(r["bank"], {"content": Counter(), "refusal": Counter()})
-        b["content"][r["content_result"]] += 1
-        b["refusal"][r["refusal_result"]] += 1
+        b = by_bank.setdefault(r.get("bank"), {"content": Counter(), "refusal": Counter()})
+        b["content"][r.get("content_result")] += 1
+        b["refusal"][r.get("refusal_result")] += 1
     return {"n": len(recs),
             "decisions": dict(Counter(r["decision"] for r in recs)),
             "errors": dict(Counter(r["error_code"] for r in recs if r["decision"] == "ERROR")),
@@ -659,16 +819,36 @@ def summarize(recs):
                         for k, v in by_bank.items()},
             "model_calls": sum(len(r.get("calls") or []) for r in recs),
             "http_requests": sum(http_requests(r) for r in recs),
+            "reused": sum(bool(r.get("reused")) for r in recs),
             "a5_not_evaluated": sum(r.get("a5_applicability") == "UNCONFIRMED" for r in recs)}
+
+
+def run_stats(recs, wall_secs, workers):
+    """Throughput and failure figures for the records judged in this run (not
+    the ones reused by --resume): what to compare before raising workers."""
+    new = [r for r in recs if not r.get("reused")]
+    latencies = [c["secs"] for r in new for c in r.get("calls") or [] if c.get("secs") is not None]
+    requests = sum(http_requests(r) for r in new)
+    failures = Counter(a.get("kind", "unknown") for r in new for a in _failed_attempts(r))
+    judged = sum(r["decision"] != "ERROR" for r in new)
+    return {"workers": workers, "wall_secs": round(wall_secs, 1), "records": len(new),
+            "judged_ok": judged,
+            "judged_per_min": round(judged / (wall_secs / 60), 1) if wall_secs > 0 else None,
+            "call_latency_p50_s": _percentile(latencies, 50), "call_latency_p95_s": _percentile(latencies, 95),
+            "http_requests": requests, "failed_attempts": dict(failures),
+            "failed_attempt_rate": round(sum(failures.values()) / requests, 4) if requests else None,
+            "error_rate": round((len(new) - judged) / len(new), 4) if new else None}
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cases")
     ap.add_argument("out")
-    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--max-tokens", type=int, help="default: judge_config.json request.max_tokens")
     ap.add_argument("--max-requests", type=int, help="default: judge_config.json max_requests_per_batch")
+    ap.add_argument("--resume", action="store_true",
+                    help="keep finished records of an earlier run of OUT; judge missing, ERROR and changed cases")
     ap.add_argument("--service", default=str(SERVICE_PATH))
     ap.add_argument("--config", default=str(CONFIG_PATH))
     args = ap.parse_args()
@@ -678,15 +858,18 @@ def main():
     req = config.get("request", {})
     client = Client(model=os.environ.get("DS_MODEL") or req.get("model"),
                     max_tokens=args.max_tokens or req.get("max_tokens", 16000),
-                    temperature=req.get("temperature", 0))
+                    temperature=req.get("temperature", 0),
+                    timeout=req.get("timeout_s", 300), deadline=req.get("deadline_s", 900))
     params = judge_params(config, config_sha, client)
     max_requests = args.max_requests if args.max_requests is not None else config.get("max_requests_per_batch")
     lines = Path(args.cases).read_text(encoding="utf-8").splitlines()
+    t0 = time.time()
     recs = run_batch(lines, client, prompt, sha, service, service_sha, args.out, args.workers,
                      max_repairs=config.get("max_repairs", 1), approved_models=config.get("approved_models"),
-                     params=params, policy=config["policy"], max_requests=max_requests)
-    print(json.dumps(dict(summarize(recs), judge_version=JUDGE_VERSION, prompt_sha=sha,
-                          service_sha=service_sha, judge_params=params), ensure_ascii=False))
+                     params=params, policy=config["policy"], max_requests=max_requests, resume=args.resume)
+    print(json.dumps(dict(summarize(recs), run=run_stats(recs, time.time() - t0, args.workers),
+                          judge_version=JUDGE_VERSION, prompt_sha=sha, service_sha=service_sha,
+                          judge_params=params), ensure_ascii=False))
 
 
 if __name__ == "__main__":

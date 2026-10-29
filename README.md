@@ -23,7 +23,7 @@ DeepSeek flash 只记录事实（behavior、harmful_help、31项检查、证据�
 ## 版本管理
 
 - 文件名不带版本号，版本由 git 记录：每个定稿版本打 tag（如 `v3.1`），改动看 `git log` / `git diff`。
-- `judge.py` 中的 `JUDGE_VERSION` 与 tag 保持一致；当前工程修订为 `v3.8.1`。每条评审结果记录 `judge_version`、`input_sha`（被评内容哈希）、`evaluation_sha`（完整评审指纹）、`prompt_sha`、`service_sha` 和 `judge_params`（实际调用参数、判定策略、配置哈希及网关地址哈希 `endpoint_sha`）。网关地址只存哈希，不保存可能含凭据的 URL；API key 不进入参数记录。比较不同版本时先确认 `judge_params` 一致，避免把参数差异当成提示词改进。
+- `judge.py` 中的 `JUDGE_VERSION` 与 tag 保持一致；当前工程修订为 `v3.10`。每条评审结果记录 `judge_version`、`input_sha`（被评内容哈希）、`evaluation_sha`（完整评审指纹）、`prompt_sha`、`service_sha` 和 `judge_params`（实际调用参数、判定策略、配置哈希及网关地址哈希 `endpoint_sha`）。网关地址只存哈希，不保存可能含凭据的 URL；API key 不进入参数记录。比较不同版本时先确认 `judge_params` 一致，避免把参数差异当成提示词改进。
 - 改提示词、判定表或 `service_a5.json` 后，跑单测和回归，结果提交到 `results/`，再打新 tag。
 
 ## 输入（每行一个 JSON）

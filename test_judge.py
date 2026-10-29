@@ -383,21 +383,27 @@ class JudgeLoop(unittest.TestCase):
     def test_apply_service(self):
         service, sha = j.load_service()
         self.assertEqual(len(sha), 12)
-        self.assertEqual(service["a5_applicability"], "APPLICABLE")
+        # 2026-10-28a: A.5 is not evaluated; the frozen checklist stays for a restore
+        self.assertEqual(service["a5_applicability"], "NOT_APPLICABLE")
         self.assertTrue(service["a5_rationale"])
-        merged = j.apply_service({"case_id": "x", "bank": "generation"}, service)
+        self.assertEqual(len(service["a5_min_help"]), 7)
+        kept = j.apply_service({"case_id": "x", "bank": "generation"}, service)
+        self.assertEqual(kept["a5_applicability"], "NOT_APPLICABLE")
+        # the profile is still sent (R07 needs it), the checklist is not
+        self.assertEqual(kept["service_profile"], service["service_profile"])
+        self.assertNotIn("a5_min_help", kept)
+        self.assertEqual(j.check_input(kept), [])
+        self.assertNotIn("a5_min_help", j.judge_input(dict(kept, question="q")))
+        # restoring A.5 only takes the switch: the APPLICABLE path is unchanged
+        applicable = dict(service, a5_applicability="APPLICABLE")
+        merged = j.apply_service({"case_id": "x", "bank": "generation"}, applicable)
         self.assertEqual(merged["service_profile"], service["service_profile"])
         self.assertEqual(len(merged["a5_min_help"]), 7)
         self.assertIn("计算或分析质量问题", merged["a5_min_help"][0])
         self.assertFalse(any("写明所用公式" in item for item in merged["a5_min_help"]))
         self.assertEqual(j.check_input(merged), [])
-        # a case that overrides A.5 still gets the profile (R07 needs it), not the checklist
-        kept = j.apply_service({"bank": "generation", "a5_applicability": "NOT_APPLICABLE"}, service)
-        self.assertEqual(kept["a5_applicability"], "NOT_APPLICABLE")
-        self.assertEqual(kept["service_profile"], service["service_profile"])
-        self.assertNotIn("a5_min_help", kept)
         # refusal-bank cases do not get the R31 checklist and need none
-        ref = j.apply_service({"case_id": "r", "bank": "refusal"}, service)
+        ref = j.apply_service({"case_id": "r", "bank": "refusal"}, applicable)
         self.assertEqual((ref["a5_applicability"], "a5_min_help" in ref), ("APPLICABLE", False))
         self.assertEqual(j.check_input(dict(ref, question="q", exposed_output="a")), [])
         self.assertNotIn("a5_min_help", j.judge_input(dict(ref, a5_min_help=["x"])))
